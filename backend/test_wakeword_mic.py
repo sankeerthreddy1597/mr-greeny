@@ -5,7 +5,8 @@ anything about the ESP32 pipeline.
 
 Setup (one-time):
     brew install portaudio
-    pip install sounddevice
+    pip install -r requirements.txt   # now includes ai-edge-litert
+    pip install sounddevice           # only this script needs it
 
 Run:
     python test_wakeword_mic.py
@@ -18,10 +19,25 @@ different problems. A real detection (score > 0.5, same threshold app.py
 uses) prints on its own line. Ctrl+C to stop.
 """
 
+import sys
 import time
+import types as pytypes
 
 import numpy as np
 import sounddevice as sd
+
+# Same tflite shim as app.py -- see the comment there for why. The onnx
+# backend was tested and found broken (scores ~0 on real "Alexa" audio);
+# tflite via ai_edge_litert is the one that actually works.
+from ai_edge_litert.interpreter import Interpreter as _LiteRTInterpreter
+
+_tflite_runtime = pytypes.ModuleType("tflite_runtime")
+_tflite_runtime_interpreter = pytypes.ModuleType("tflite_runtime.interpreter")
+_tflite_runtime_interpreter.Interpreter = _LiteRTInterpreter
+_tflite_runtime.interpreter = _tflite_runtime_interpreter
+sys.modules["tflite_runtime"] = _tflite_runtime
+sys.modules["tflite_runtime.interpreter"] = _tflite_runtime_interpreter
+
 from openwakeword.model import Model
 from openwakeword.utils import download_models
 
@@ -31,7 +47,7 @@ DETECT_THRESHOLD = 0.5
 HEARTBEAT_SECONDS = 0.5
 
 download_models()  # no-op if already cached
-model = Model(wakeword_models=[], inference_framework="onnx")  # bundled pretrained models
+model = Model(wakeword_models=[], inference_framework="tflite")  # bundled pretrained models
 
 print("Listening on the default input device. Say: alexa / hey jarvis / hey mycroft / hey rhasspy / weather")
 print("Printing a heartbeat (best score + audio rms) so you can see it's alive even below threshold.")
