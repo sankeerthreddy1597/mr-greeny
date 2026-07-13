@@ -71,17 +71,26 @@ download_wakeword_models()  # no-op if already downloaded; model files aren't bu
 wakeword_model = WakeWordModel(wakeword_models=WAKEWORD_MODEL_PATHS, inference_framework="tflite")
 WAKE_SCORE_THRESHOLD = 0.5
 
+# How long to keep the Live session open with no new turn after the last
+# reply finishes, before closing it and re-arming the wake word. Mirrors
+# Pixel's short "still listening" follow-up window -- long enough for a
+# natural pause in conversation, short enough not to bill/stream forever.
+IDLE_TIMEOUT_SECONDS = 15.0
+
 
 class WakeGate:
     """Runs openWakeWord on incoming PCM until the wake word fires once.
 
-    After that this connection is considered "awake" for good -- all further
-    mic audio streams straight into the Gemini Live session, which does its
-    own turn-taking/VAD server-side. TODO: add a sleep-timeout (like Pixel's
-    runtime_sleep_timeout) to re-arm the wake word after a period of silence.
+    After that this connection is considered "awake" -- all further mic audio
+    streams straight into the Gemini Live session, which does its own
+    turn-taking/VAD server-side. Re-armed by LiveSession's idle timeout (see
+    `rearm`) once a conversation goes quiet for IDLE_TIMEOUT_SECONDS.
     """
 
     def __init__(self):
+        self.awake = False
+
+    def rearm(self):
         self.awake = False
 
     def check(self, pcm_bytes: bytes) -> bool:
@@ -98,15 +107,17 @@ class WakeGate:
 class LiveSession:
     """One Gemini Live API session for a connected board: PCM in, audio+text out."""
 
-    def __init__(self, client: genai.Client, send_text, send_binary):
+    def __init__(self, client: genai.Client, send_text, send_binary, on_idle_close):
         self._client = client
         self._send_text = send_text
         self._send_binary = send_binary
+        self._on_idle_close = on_idle_close
         self._session_cm = None
         self._session = None
         self._pcm_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._sender_task: asyncio.Task | None = None
         self._receiver_task: asyncio.Task | None = None
+        self._idle_timer_task: asyncio.Task | None = None
         self._speaking = False
 
     async def ensure_started(self):
@@ -132,6 +143,28 @@ class LiveSession:
         except asyncio.QueueFull:
             pass
 
+    def _cancel_idle_timer(self):
+        # _idle_timeout() calls close() -> _cancel_idle_timer() on itself when
+        # it fires; cancelling the currently-running task here would abort
+        # close() partway through at its next await, so skip self-cancellation.
+        task = self._idle_timer_task
+        self._idle_timer_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _start_idle_timer(self):
+        self._cancel_idle_timer()
+        self._idle_timer_task = asyncio.create_task(self._idle_timeout())
+
+    async def _idle_timeout(self):
+        try:
+            await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        log.info("Live session idle for %.0fs, closing and re-arming wake word", IDLE_TIMEOUT_SECONDS)
+        await self.close()
+        self._on_idle_close()
+
     async def _sender_loop(self):
         while True:
             chunk = await self._pcm_queue.get()
@@ -153,6 +186,7 @@ class LiveSession:
 
                 if sc.model_turn and not self._speaking:
                     self._speaking = True
+                    self._cancel_idle_timer()  # new turn started -- still an active conversation
                     await self._send_text(json.dumps({"type": "assistant_speaking", "state": "start"}))
 
                 if sc.output_transcription and sc.output_transcription.text:
@@ -170,20 +204,29 @@ class LiveSession:
                 if (sc.turn_complete or sc.interrupted) and self._speaking:
                     self._speaking = False
                     await self._send_text(json.dumps({"type": "assistant_speaking", "state": "stop"}))
+                    self._start_idle_timer()  # reply finished -- start counting down to auto-close
         except asyncio.CancelledError:
             pass
         except Exception:
             log.exception("Live receive loop ended")
 
     async def close(self):
+        self._cancel_idle_timer()
         for t in (self._sender_task, self._receiver_task):
             if t is not None:
                 t.cancel()
+        self._sender_task = None
+        self._receiver_task = None
         if self._session_cm is not None:
             try:
                 await self._session_cm.__aexit__(None, None, None)
             except Exception:
                 log.debug("Live session __aexit__ failed", exc_info=True)
+        # Reset so a later ensure_started() (re-armed wake word -> spoken
+        # again) opens a fresh session instead of thinking one is still open.
+        self._session_cm = None
+        self._session = None
+        self._speaking = False
 
 
 @app.websocket("/ws/stream")
@@ -192,7 +235,11 @@ async def stream_endpoint(websocket: WebSocket):
     log.info("board connected")
 
     gate = WakeGate()
-    live = LiveSession(genai_client, websocket.send_text, websocket.send_bytes) if genai_client else None
+    live = (
+        LiveSession(genai_client, websocket.send_text, websocket.send_bytes, gate.rearm)
+        if genai_client
+        else None
+    )
 
     try:
         while True:
