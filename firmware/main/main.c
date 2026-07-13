@@ -1,4 +1,5 @@
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -255,12 +256,31 @@ static void mic_stream_task(void *arg)
     packet[0] = AUDIO_PACKET_TYPE;
     int16_t *pcm = (int16_t *)&packet[1];
 
+    // ~64ms/chunk at 16kHz -> log roughly once/sec. Prints real min/max/RMS
+    // so a dead mic (flat zeros, or a stuck DC value) is visibly distinct
+    // from real ambient sound.
+    int log_counter = 0;
+
     for (;;) {
         int ret = esp_codec_dev_read(s_mic_dev, pcm, MIC_CHUNK_BYTES);
         if (ret != ESP_CODEC_DEV_OK) {
             ESP_LOGW(TAG, "mic read failed: %d", ret);
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
+        }
+
+        if (++log_counter >= 15) {
+            log_counter = 0;
+            int16_t min_v = INT16_MAX, max_v = INT16_MIN;
+            int64_t sum_sq = 0;
+            for (int i = 0; i < MIC_CHUNK_SAMPLES; i++) {
+                int16_t s = pcm[i];
+                if (s < min_v) min_v = s;
+                if (s > max_v) max_v = s;
+                sum_sq += (int32_t)s * (int32_t)s;
+            }
+            int rms = (int)sqrtf((float)sum_sq / MIC_CHUNK_SAMPLES);
+            ESP_LOGI(TAG, "mic: min=%d max=%d rms=%d", min_v, max_v, rms);
         }
 
         if (esp_websocket_client_is_connected(s_ws_client)) {
@@ -280,6 +300,14 @@ static void start_mic(void)
         .bits_per_sample = MIC_BITS,
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(s_mic_dev, &fs));
+
+    // BSP defaults to 30dB; push to the ES7210's max (37.5dB) since normal
+    // speech was only reaching rms ~20-60 out of a possible 32767 -- observed
+    // via the mic: min/max/rms log in mic_stream_task.
+    int gain_ret = esp_codec_dev_set_in_gain(s_mic_dev, 37.5f);
+    if (gain_ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "set_in_gain failed: %d", gain_ret);
+    }
 }
 
 static void start_websocket(void)
