@@ -2,12 +2,35 @@ import asyncio
 import json
 import logging
 import os
+import sys
+import types as pytypes
 
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
+
+# openWakeWord only knows how to import the tflite backend via the
+# `tflite_runtime` package, which has no wheel for this platform/Python combo.
+# `ai_edge_litert` (Google's actively-maintained successor, much lighter than
+# full tensorflow) provides a drop-in-compatible Interpreter, so we shim a
+# fake `tflite_runtime.interpreter` module pointing at it before importing
+# openwakeword. This matters: the bundled `onnx` models were tested here and
+# scored ~0 on both a clean synthesized "Alexa" clip and real speech (feature
+# extraction looked healthy, VAD/windowing/warm-up all ruled out) -- the
+# tflite models scored a clean 1.0 on the same clip. This looks like a real
+# bug in this openwakeword release's onnx models/backend, not our
+# integration, so tflite is the one to actually use.
+from ai_edge_litert.interpreter import Interpreter as _LiteRTInterpreter
+
+_tflite_runtime = pytypes.ModuleType("tflite_runtime")
+_tflite_runtime_interpreter = pytypes.ModuleType("tflite_runtime.interpreter")
+_tflite_runtime_interpreter.Interpreter = _LiteRTInterpreter
+_tflite_runtime.interpreter = _tflite_runtime_interpreter
+sys.modules["tflite_runtime"] = _tflite_runtime
+sys.modules["tflite_runtime.interpreter"] = _tflite_runtime_interpreter
+
 from openwakeword.model import Model as WakeWordModel
 from openwakeword.utils import download_models as download_wakeword_models
 
@@ -44,8 +67,8 @@ WAKEWORD_MODEL_PATHS: list[str] = [
     # "wakeword_models/hey_greeny.onnx",
 ]
 
-download_wakeword_models()  # no-op if already downloaded; onnx models aren't bundled in the pip package
-wakeword_model = WakeWordModel(wakeword_models=WAKEWORD_MODEL_PATHS, inference_framework="onnx")
+download_wakeword_models()  # no-op if already downloaded; model files aren't bundled in the pip package
+wakeword_model = WakeWordModel(wakeword_models=WAKEWORD_MODEL_PATHS, inference_framework="tflite")
 WAKE_SCORE_THRESHOLD = 0.5
 
 
