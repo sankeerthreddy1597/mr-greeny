@@ -450,6 +450,14 @@ static void playback_task(void *arg)
                 continue;
             }
             speaker_open = true;
+
+            // Must be set AFTER open (ESP_CODEC_DEV_WRONG_STATE otherwise).
+            // Never set at all before this -- almost certainly why nothing
+            // was audible despite writes succeeding without error.
+            int vol_ret = esp_codec_dev_set_out_vol(s_speaker_dev, 80);
+            if (vol_ret != ESP_CODEC_DEV_OK) {
+                ESP_LOGW(TAG, "speaker set_out_vol failed: %d", vol_ret);
+            }
         }
 
         int ret = esp_codec_dev_write(s_speaker_dev, chunk.data, (int)chunk.len);
