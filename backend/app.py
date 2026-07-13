@@ -38,7 +38,8 @@ from openwakeword.utils import download_models as download_wakeword_models
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+                     datefmt="%H:%M:%S")
 log = logging.getLogger("mr-greeny")
 
 app = FastAPI()
