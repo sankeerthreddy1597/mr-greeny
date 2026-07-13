@@ -175,6 +175,15 @@ async def stream_endpoint(websocket: WebSocket):
         while True:
             message = await websocket.receive()
 
+            # The raw receive() API returns this as a normal message rather
+            # than raising WebSocketDisconnect (that's only done by the
+            # receive_bytes()/receive_text()/receive_json() wrappers) --
+            # calling receive() again after this arrives raises a RuntimeError
+            # and was silently killing every connection before this check
+            # existed.
+            if message["type"] == "websocket.disconnect":
+                break
+
             data = message.get("bytes")
             if data is not None:
                 packet_type, payload = data[0], data[1:]
