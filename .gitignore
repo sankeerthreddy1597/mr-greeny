@@ -1,0 +1,15 @@
+# ESP-IDF firmware
+firmware/build/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig
+firmware/.vscode/
+
+# Python backend
+backend/.venv/
+backend/__pycache__/
+backend/*.pyc
+backend/wakeword_models/*.onnx
+backend/wakeword_models/*.tflite
+
+.DS_Store

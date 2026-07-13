@@ -1,0 +1,11 @@
+menu "Mr. Greeny Configuration"
+
+    config MRGREENY_BACKEND_WS_URL
+        string "Backend WebSocket URL"
+        default "ws://192.168.1.100:8000/ws/stream"
+        help
+            WebSocket endpoint of the mr-greeny backend (see ../backend). Point this
+            at the LAN IP of the machine running the backend, e.g.
+            ws://<your-machine-ip>:8000/ws/stream.
+
+endmenu
