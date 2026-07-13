@@ -84,6 +84,7 @@ class LiveSession:
         self._pcm_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._sender_task: asyncio.Task | None = None
         self._receiver_task: asyncio.Task | None = None
+        self._speaking = False
 
     async def ensure_started(self):
         if self._session is not None:
@@ -127,6 +128,10 @@ class LiveSession:
                 if sc is None:
                     continue
 
+                if sc.model_turn and not self._speaking:
+                    self._speaking = True
+                    await self._send_text(json.dumps({"type": "assistant_speaking", "state": "start"}))
+
                 if sc.output_transcription and sc.output_transcription.text:
                     await self._send_text(json.dumps({
                         "status": "success",
@@ -138,6 +143,10 @@ class LiveSession:
                         inline = getattr(part, "inline_data", None)
                         if inline and inline.data:
                             await self._send_binary(bytes([FRAME_TYPE_REPLY_PCM]) + inline.data)
+
+                if (sc.turn_complete or sc.interrupted) and self._speaking:
+                    self._speaking = False
+                    await self._send_text(json.dumps({"type": "assistant_speaking", "state": "stop"}))
         except asyncio.CancelledError:
             pass
         except Exception:

@@ -12,6 +12,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "esp_codec_dev.h"
+#include "cJSON.h"
 
 static const char *TAG = "mr_greeny";
 
@@ -32,10 +33,16 @@ static lv_obj_t *s_status_label;
 static lv_obj_t *s_eyes_cont;
 static lv_obj_t *s_eye_left;
 static lv_obj_t *s_eye_right;
+static lv_obj_t *s_mouth;
 
 #define EYE_WIDTH   90
 #define EYE_HEIGHT  130
 #define EYE_GAP     60
+
+#define MOUTH_WIDTH         70
+#define MOUTH_HEIGHT_CLOSED 6
+#define MOUTH_HEIGHT_OPEN   30
+#define MOUTH_Y_OFFSET      150
 
 // Blink loop: closes to 10px over 120ms, holds, reopens over 120ms, then
 // waits ~2.6s before repeating -- runs forever once started, driven entirely
@@ -70,6 +77,27 @@ static lv_obj_t *make_eye(lv_obj_t *parent)
     return eye;
 }
 
+// Fast, continuous open/close pulse simulating a talking mouth. Runs
+// forever in the background once started; toggling s_mouth's HIDDEN flag
+// (see show_talking) is what actually turns it on/off visually.
+static void mouth_pulse_cb(void *var, int32_t v)
+{
+    lv_obj_set_height((lv_obj_t *)var, v);
+}
+
+static void start_mouth_pulse(void)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_mouth);
+    lv_anim_set_exec_cb(&a, mouth_pulse_cb);
+    lv_anim_set_values(&a, MOUTH_HEIGHT_CLOSED, MOUTH_HEIGHT_OPEN);
+    lv_anim_set_duration(&a, 150);
+    lv_anim_set_reverse_duration(&a, 150);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+}
+
 // Builds both UI states once at startup; ws_event_handler only ever toggles
 // which one is hidden/visible and updates the label's text in place, instead
 // of tearing down and recreating objects on every reconnect attempt (that
@@ -102,6 +130,16 @@ static void setup_ui(void)
     start_blink_anim(s_eye_left);
     start_blink_anim(s_eye_right);
 
+    s_mouth = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_mouth);
+    lv_obj_set_size(s_mouth, MOUTH_WIDTH, MOUTH_HEIGHT_CLOSED);
+    lv_obj_set_style_bg_color(s_mouth, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_mouth, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_mouth, MOUTH_HEIGHT_CLOSED / 2, 0);
+    lv_obj_align(s_mouth, LV_ALIGN_CENTER, 0, MOUTH_Y_OFFSET);
+    lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
+    start_mouth_pulse();
+
     bsp_display_unlock();
 }
 
@@ -118,6 +156,7 @@ static void show_status_text(const char *text)
 {
     bsp_display_lock(-1);
     lv_obj_add_flag(s_eyes_cont, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
     bsp_display_unlock();
 
     vTaskDelay(pdMS_TO_TICKS(UI_TRANSITION_SETTLE_MS));
@@ -132,6 +171,7 @@ static void show_eyes(void)
 {
     bsp_display_lock(-1);
     lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
     bsp_display_unlock();
 
     vTaskDelay(pdMS_TO_TICKS(UI_TRANSITION_SETTLE_MS));
@@ -139,6 +179,50 @@ static void show_eyes(void)
     bsp_display_lock(-1);
     lv_obj_clear_flag(s_eyes_cont, LV_OBJ_FLAG_HIDDEN);
     bsp_display_unlock();
+}
+
+// Mouth toggles on top of the already-visible eyes; a single small object's
+// visibility flag is a small enough invalidate that it doesn't need the
+// two-refresh-cycle staggering show_eyes/show_status_text use.
+static void show_talking(bool talking)
+{
+    bsp_display_lock(-1);
+    if (talking) {
+        lv_obj_clear_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
+    }
+    bsp_display_unlock();
+}
+
+// Handles {"type": "assistant_speaking", "state": "start"|"stop"} sent by the
+// backend's LiveSession while a Gemini reply is being generated (see
+// backend/app.py). Only single, unfragmented text frames are handled --
+// these JSON messages are tiny and always arrive in one frame in practice.
+static void handle_ws_text(const esp_websocket_event_data_t *data)
+{
+    if (data->op_code != WS_TRANSPORT_OPCODES_TEXT || data->data_len <= 0) {
+        return;
+    }
+    if (data->payload_offset != 0 || data->data_len != data->payload_len) {
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(data->data_ptr, data->data_len);
+    if (root == NULL) {
+        return;
+    }
+
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    if (cJSON_IsString(type) && type->valuestring != NULL &&
+        strcmp(type->valuestring, "assistant_speaking") == 0) {
+        const cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "state");
+        if (cJSON_IsString(state) && state->valuestring != NULL) {
+            show_talking(strcmp(state->valuestring, "start") == 0);
+        }
+    }
+
+    cJSON_Delete(root);
 }
 
 static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -152,6 +236,9 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "backend disconnected, retrying...");
         show_status_text("Mr. Greeny\nreconnecting...");
+        break;
+    case WEBSOCKET_EVENT_DATA:
+        handle_ws_text((const esp_websocket_event_data_t *)event_data);
         break;
     default:
         break;
