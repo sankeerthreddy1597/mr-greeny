@@ -11,5 +11,6 @@ backend/__pycache__/
 backend/*.pyc
 backend/wakeword_models/*.onnx
 backend/wakeword_models/*.tflite
+backend/.env
 
 .DS_Store

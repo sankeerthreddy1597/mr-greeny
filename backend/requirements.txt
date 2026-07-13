@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 numpy
 openwakeword
+python-dotenv
+google-genai>=1.50.0
