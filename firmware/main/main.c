@@ -1,7 +1,9 @@
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -13,6 +15,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "esp_codec_dev.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "mr_greeny";
@@ -20,6 +23,9 @@ static const char *TAG = "mr_greeny";
 // Matches the binary framing used by OmniBot's Pixel bot: [1-byte packet type][payload].
 // We only need the mic-PCM type since this board has no camera.
 #define AUDIO_PACKET_TYPE   0x10
+// backend -> board: Gemini's reply audio, resampled server-side to 16kHz to
+// match the mic/speaker's shared duplex I2S bus (see backend/app.py).
+#define REPLY_PCM_PACKET_TYPE 0x20
 
 #define MIC_SAMPLE_RATE     16000
 #define MIC_CHANNELS        1
@@ -27,8 +33,23 @@ static const char *TAG = "mr_greeny";
 #define MIC_CHUNK_SAMPLES   1024 // ~64 ms per chunk at 16 kHz
 #define MIC_CHUNK_BYTES     (MIC_CHUNK_SAMPLES * (MIC_BITS / 8))
 
+#define SPEAKER_SAMPLE_RATE 16000 // must match MIC_SAMPLE_RATE -- shared duplex I2S bus
+#define SPEAKER_CHANNELS    1
+#define SPEAKER_BITS        16
+// Generous single-message cap; a fragment straddling this gets dropped with
+// a warning rather than overflowing the reassembly buffer.
+#define REPLY_AUDIO_MAX_BYTES 32768
+
 static esp_websocket_client_handle_t s_ws_client;
 static esp_codec_dev_handle_t s_mic_dev;
+static esp_codec_dev_handle_t s_speaker_dev;
+static QueueHandle_t s_playback_queue;
+static uint8_t *s_reassembly_buf; // PSRAM -- see init_reply_audio_buffer()
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+} playback_chunk_t;
 
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_eyes_cont;
@@ -226,6 +247,68 @@ static void handle_ws_text(const esp_websocket_event_data_t *data)
     cJSON_Delete(root);
 }
 
+// Reassembles Gemini reply audio (REPLY_PCM_PACKET_TYPE) across however many
+// WEBSOCKET_EVENT_DATA fragments one logical WS message gets split into --
+// these chunks are a few KB of 16kHz PCM per streamed part, comfortably over
+// the client's default 1KB buffer_size (bumped in start_websocket(), but
+// reassembly here makes correctness independent of that tuning). Complete
+// frames get copied into a fresh heap buffer and queued for playback_task;
+// dropped (with a warning) if a frame ever exceeds REPLY_AUDIO_MAX_BYTES.
+static void handle_ws_binary(const esp_websocket_event_data_t *data)
+{
+    static int s_received = 0;
+    static bool s_overflowed = false;
+
+    if (data->op_code != WS_TRANSPORT_OPCODES_BINARY || data->data_len <= 0) {
+        return;
+    }
+    if (s_reassembly_buf == NULL) {
+        return; // init_reply_audio_buffer() hasn't run yet
+    }
+
+    if (data->payload_offset == 0) {
+        s_received = 0;
+        s_overflowed = false;
+    }
+
+    if (s_overflowed) {
+        return;
+    }
+
+    if (s_received + data->data_len > REPLY_AUDIO_MAX_BYTES) {
+        ESP_LOGW(TAG, "reply audio frame too large (%d bytes), dropping", data->payload_len);
+        s_overflowed = true;
+        return;
+    }
+
+    memcpy(&s_reassembly_buf[s_received], data->data_ptr, data->data_len);
+    s_received += data->data_len;
+
+    if (s_received != data->payload_len) {
+        return; // wait for more fragments
+    }
+
+    if (s_received < 1 || s_reassembly_buf[0] != REPLY_PCM_PACKET_TYPE) {
+        return;
+    }
+
+    size_t audio_len = s_received - 1;
+    playback_chunk_t chunk = {
+        .data = malloc(audio_len),
+        .len = audio_len,
+    };
+    if (chunk.data == NULL) {
+        ESP_LOGW(TAG, "playback chunk alloc failed (%d bytes)", (int)audio_len);
+        return;
+    }
+    memcpy(chunk.data, &s_reassembly_buf[1], audio_len);
+
+    if (xQueueSend(s_playback_queue, &chunk, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "playback queue full, dropping chunk");
+        free(chunk.data);
+    }
+}
+
 static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     switch (event_id) {
@@ -238,9 +321,15 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
         ESP_LOGW(TAG, "backend disconnected, retrying...");
         show_status_text("Mr. Greeny\nreconnecting...");
         break;
-    case WEBSOCKET_EVENT_DATA:
-        handle_ws_text((const esp_websocket_event_data_t *)event_data);
+    case WEBSOCKET_EVENT_DATA: {
+        const esp_websocket_event_data_t *data = (const esp_websocket_event_data_t *)event_data;
+        if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
+            handle_ws_text(data);
+        } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+            handle_ws_binary(data);
+        }
         break;
+    }
     default:
         break;
     }
@@ -310,10 +399,92 @@ static void start_mic(void)
     }
 }
 
+// Dedicated task drains s_playback_queue and writes to the speaker codec, so
+// a slow/blocking hardware write never stalls the WebSocket client's own
+// task (which is what enqueues chunks from handle_ws_binary).
+//
+// The speaker's I2S TX channel is opened lazily (on the first chunk of a
+// reply) and closed again after PLAYBACK_IDLE_CLOSE_MS of no new chunks,
+// rather than held open continuously from boot. Confirmed on hardware: an
+// always-open TX channel continuously clocks (even silence) via DMA, and
+// that constant activity contended with the display's own SPI DMA queue
+// badly enough to corrupt the whole screen permanently, not just during
+// playback -- keeping it open only during actual replies confines that
+// contention to the (much smaller) windows when audio is really playing.
+#define PLAYBACK_IDLE_CLOSE_MS 800
+
+static void playback_task(void *arg)
+{
+    playback_chunk_t chunk;
+    bool speaker_open = false;
+
+    for (;;) {
+        if (xQueueReceive(s_playback_queue, &chunk, pdMS_TO_TICKS(PLAYBACK_IDLE_CLOSE_MS)) != pdTRUE) {
+            if (speaker_open) {
+                esp_codec_dev_close(s_speaker_dev);
+                speaker_open = false;
+            }
+            continue;
+        }
+
+        if (!speaker_open) {
+            esp_codec_dev_sample_info_t fs = {
+                .sample_rate = SPEAKER_SAMPLE_RATE,
+                .channel = SPEAKER_CHANNELS,
+                .bits_per_sample = SPEAKER_BITS,
+            };
+            int open_ret = esp_codec_dev_open(s_speaker_dev, &fs);
+            if (open_ret != ESP_CODEC_DEV_OK) {
+                ESP_LOGW(TAG, "speaker open failed: %d", open_ret);
+                free(chunk.data);
+                continue;
+            }
+            speaker_open = true;
+        }
+
+        int ret = esp_codec_dev_write(s_speaker_dev, chunk.data, (int)chunk.len);
+        if (ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "speaker write failed: %d", ret);
+        }
+        free(chunk.data);
+    }
+}
+
+// The 32KB reassembly buffer must NOT be a plain `static` array -- that
+// lands in internal DIRAM, which the display's SPI DMA queue also draws
+// from (a scarce, shared pool distinct from the 8MB of PSRAM). A static
+// array here was confirmed (via `idf.py size` + a bisection test) to push
+// DIRAM usage high enough to make the display driver's own DMA-capable
+// allocations fail continuously -- corrupting the whole screen, not just
+// during playback. PSRAM has no such contention.
+static void init_reply_audio_buffer(void)
+{
+    s_reassembly_buf = heap_caps_malloc(REPLY_AUDIO_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    assert(s_reassembly_buf != NULL);
+}
+
+static void start_speaker(void)
+{
+    // Just gets the codec handle -- doesn't touch I2S yet. The actual
+    // esp_codec_dev_open() (which enables the I2S TX channel) happens lazily
+    // in playback_task, only while a reply is actually playing.
+    s_speaker_dev = bsp_audio_codec_speaker_init();
+    assert(s_speaker_dev);
+
+    s_playback_queue = xQueueCreate(8, sizeof(playback_chunk_t));
+    assert(s_playback_queue != NULL);
+
+    xTaskCreate(playback_task, "playback", 4096, NULL, 5, NULL);
+}
+
 static void start_websocket(void)
 {
     esp_websocket_client_config_t ws_cfg = {
         .uri = CONFIG_MRGREENY_BACKEND_WS_URL,
+        // Default is 1KB; Gemini reply audio chunks are several KB. handle_ws_binary
+        // reassembles fragments regardless, but a bigger buffer means fewer of them
+        // in practice.
+        .buffer_size = 8192,
     };
     s_ws_client = esp_websocket_client_init(&ws_cfg);
     esp_websocket_register_events(s_ws_client, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
@@ -333,8 +504,10 @@ void app_main(void)
     // `idf.py menuconfig` -> Example Connection Configuration.
     ESP_ERROR_CHECK(example_connect());
 
+    init_reply_audio_buffer();
     start_websocket();
     start_mic();
+    start_speaker();
 
     xTaskCreate(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL);
 }

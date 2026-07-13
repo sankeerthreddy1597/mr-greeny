@@ -1,4 +1,6 @@
 import asyncio
+import audioop  # stdlib; deprecated since 3.11, removed in 3.13 -- swap for
+                # e.g. scipy.signal.resample_poly if/when this venv upgrades past 3.12
 import json
 import logging
 import os
@@ -43,7 +45,15 @@ app = FastAPI()
 
 SAMPLE_RATE_IN = 16000  # board mic, matches firmware/main/main.c
 FRAME_TYPE_MIC_PCM = 0x10  # board -> backend
-FRAME_TYPE_REPLY_PCM = 0x20  # backend -> board, 24kHz PCM (not yet consumed by firmware)
+FRAME_TYPE_REPLY_PCM = 0x20  # backend -> board, 16kHz PCM after resampling (see below)
+
+# Gemini Live's native output audio is 24kHz, but the board's ES7210 mic and
+# ES8311 speaker share one I2S bus in duplex mode, which must run RX/TX at
+# the same rate -- and the mic side is fixed at 16kHz (wake word + Gemini
+# input both expect it). Resampling here keeps the board's I2S bus at one
+# consistent rate instead of needing two separate duplex configurations.
+LIVE_OUTPUT_SAMPLE_RATE = 24000
+BOARD_OUTPUT_SAMPLE_RATE = 16000
 
 # Preview model name taken from a known-working Gemini Live integration
 # (OmniBot's Pixel bot). Preview model names/availability can shift over
@@ -119,6 +129,7 @@ class LiveSession:
         self._receiver_task: asyncio.Task | None = None
         self._idle_timer_task: asyncio.Task | None = None
         self._speaking = False
+        self._resample_state = None  # audioop.ratecv continuity across chunks in a turn
 
     async def ensure_started(self):
         if self._session is not None:
@@ -199,7 +210,12 @@ class LiveSession:
                     for part in sc.model_turn.parts:
                         inline = getattr(part, "inline_data", None)
                         if inline and inline.data:
-                            await self._send_binary(bytes([FRAME_TYPE_REPLY_PCM]) + inline.data)
+                            resampled, self._resample_state = audioop.ratecv(
+                                inline.data, 2, 1,
+                                LIVE_OUTPUT_SAMPLE_RATE, BOARD_OUTPUT_SAMPLE_RATE,
+                                self._resample_state,
+                            )
+                            await self._send_binary(bytes([FRAME_TYPE_REPLY_PCM]) + resampled)
 
                 if (sc.turn_complete or sc.interrupted) and self._speaking:
                     self._speaking = False
@@ -227,6 +243,7 @@ class LiveSession:
         self._session_cm = None
         self._session = None
         self._speaking = False
+        self._resample_state = None
 
 
 @app.websocket("/ws/stream")
