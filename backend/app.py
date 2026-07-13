@@ -189,10 +189,27 @@ class LiveSession:
                 log.exception("Live audio send failed")
 
     async def _receiver_loop(self):
+        # Every termination path here (go_away, the generator ending on its
+        # own, or an unexpected exception) needs the same cleanup: close the
+        # session and re-arm the wake gate. Previously none of these paths did
+        # that -- session state (self._session etc.) was left stale, so a
+        # later ensure_started() silently no-op'd forever, thinking a session
+        # was still open. That's the likely explanation for "works once, then
+        # the second turn just doesn't, then it goes idle" -- whatever ended
+        # the first turn's session (very possibly a GoAway, which Gemini Live
+        # sends shortly before force-closing a session -- these preview models
+        # have short max session durations) went completely unnoticed.
         try:
             async for msg in self._session.receive():
+                # go_away is a sibling of server_content, not nested inside it.
+                if msg.go_away is not None:
+                    log.warning("Gemini Live GoAway received (time_left=%s) -- closing session",
+                                getattr(msg.go_away, "time_left", None))
+                    break
+
                 sc = msg.server_content
                 if sc is None:
+                    log.debug("Live message with no server_content: %s", msg)
                     continue
 
                 if sc.model_turn and not self._speaking:
@@ -222,14 +239,22 @@ class LiveSession:
                     await self._send_text(json.dumps({"type": "assistant_speaking", "state": "stop"}))
                     self._start_idle_timer()  # reply finished -- start counting down to auto-close
         except asyncio.CancelledError:
-            pass
+            # An external close() (shutdown, idle timeout) is already tearing
+            # this down -- don't re-run cleanup on top of that.
+            return
         except Exception:
             log.exception("Live receive loop ended")
+
+        # Reached for every other termination path (go_away, or the receive()
+        # generator just ending on its own) -- always clean up and re-arm.
+        log.info("Live session receive loop ended -- closing and re-arming wake word")
+        await self.close()
+        self._on_idle_close()
 
     async def close(self):
         self._cancel_idle_timer()
         for t in (self._sender_task, self._receiver_task):
-            if t is not None:
+            if t is not None and t is not asyncio.current_task():
                 t.cancel()
         self._sender_task = None
         self._receiver_task = None
