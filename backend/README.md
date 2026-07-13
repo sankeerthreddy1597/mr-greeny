@@ -28,6 +28,22 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 Point the firmware's `MRGREENY_BACKEND_WS_URL` (`idf.py menuconfig` -> Mr.
 Greeny Configuration) at `ws://<this-machine's-LAN-IP>:8000/ws/stream`.
 
+## Testing the wake word independent of the board
+
+`test_wakeword_mic.py` runs openWakeWord against this machine's own
+microphone -- no board, WiFi, or `/ws/stream` involved. Useful for confirming
+the wake-word library itself works before debugging anything about the
+ESP32 pipeline.
+
+```bash
+brew install portaudio
+pip install sounddevice
+python test_wakeword_mic.py
+```
+
+Say "alexa", "hey jarvis", "hey mycroft", "hey rhasspy", or "weather" and
+watch the printed scores.
+
 ## Status of this scaffold
 
 - Wake-word detection (openWakeWord) gates when a Gemini **Live** session
