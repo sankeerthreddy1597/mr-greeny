@@ -46,6 +46,15 @@ static esp_codec_dev_handle_t s_speaker_dev;
 static QueueHandle_t s_playback_queue;
 static uint8_t *s_reassembly_buf; // PSRAM -- see init_reply_audio_buffer()
 
+// Set/cleared only by playback_task; read by mic_stream_task to skip sending
+// mic audio to the backend while the speaker is actually emitting sound (see
+// the note above playback_task for why this is the local/low-latency signal
+// to use instead of the backend's turn-based "assistant_speaking" event --
+// this board has no acoustic echo cancellation, so without muting, the mic
+// picks up the speaker's own output and feeds it right back to Gemini,
+// causing it to interrupt or answer itself).
+static volatile bool s_speaker_playing = false;
+
 typedef struct {
     uint8_t *data;
     size_t len;
@@ -382,7 +391,12 @@ static void mic_stream_task(void *arg)
             ESP_LOGI(TAG, "mic: min=%d max=%d rms=%d", min_v, max_v, rms);
         }
 
-        if (esp_websocket_client_is_connected(s_ws_client)) {
+        // Keep reading (drains the codec's DMA buffer either way) but don't
+        // send to the backend while the speaker is playing -- this board has
+        // no acoustic echo cancellation, so without this the mic picks up
+        // the speaker's own output and feeds it right back to Gemini,
+        // causing it to interrupt or answer itself.
+        if (!s_speaker_playing && esp_websocket_client_is_connected(s_ws_client)) {
             esp_websocket_client_send_bin(s_ws_client, (const char *)packet, sizeof(packet), portMAX_DELAY);
         }
     }
@@ -421,6 +435,11 @@ static void start_mic(void)
 // badly enough to corrupt the whole screen permanently, not just during
 // playback -- keeping it open only during actual replies confines that
 // contention to the (much smaller) windows when audio is really playing.
+//
+// This same open/close window also drives s_speaker_playing, which mutes
+// the mic (see mic_stream_task) -- the PLAYBACK_IDLE_CLOSE_MS trailing grace
+// period before actually closing conveniently also covers any brief acoustic
+// ringing/reverb right after the last sample plays.
 #define PLAYBACK_IDLE_CLOSE_MS 800
 
 static void playback_task(void *arg)
@@ -433,6 +452,7 @@ static void playback_task(void *arg)
             if (speaker_open) {
                 esp_codec_dev_close(s_speaker_dev);
                 speaker_open = false;
+                s_speaker_playing = false;
             }
             continue;
         }
@@ -450,6 +470,7 @@ static void playback_task(void *arg)
                 continue;
             }
             speaker_open = true;
+            s_speaker_playing = true;
 
             // Must be set AFTER open (ESP_CODEC_DEV_WRONG_STATE otherwise).
             // Never set at all before this -- almost certainly why nothing
