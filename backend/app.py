@@ -146,6 +146,7 @@ class LiveSession:
         self._session = await self._session_cm.__aenter__()
         self._sender_task = asyncio.create_task(self._sender_loop())
         self._receiver_task = asyncio.create_task(self._receiver_loop())
+        self._start_idle_timer()  # safety net: still closes even if Gemini never sends anything at all
         log.info("Gemini Live session opened")
 
     def feed_pcm(self, chunk: bytes) -> None:
@@ -201,6 +202,18 @@ class LiveSession:
         # have short max session durations) went completely unnoticed.
         try:
             async for msg in self._session.receive():
+                # Reset the idle countdown on ANY message from Gemini, not
+                # just a clean turn_complete -- the Live API docs note
+                # turn_complete can be held back pending an assumed
+                # "realtime playback finished" signal that we never send
+                # (we're not doing literal client-side playback progress
+                # reporting), so relying on it alone meant the countdown
+                # sometimes never started at all and the session never
+                # idle-closed. This is simpler and can't get stuck the same
+                # way: 15s of Gemini going completely silent, for any
+                # reason, is a reasonable definition of "conversation over."
+                self._start_idle_timer()
+
                 # go_away is a sibling of server_content, not nested inside it.
                 if msg.go_away is not None:
                     log.warning("Gemini Live GoAway received (time_left=%s) -- closing session",
@@ -214,7 +227,6 @@ class LiveSession:
 
                 if sc.model_turn and not self._speaking:
                     self._speaking = True
-                    self._cancel_idle_timer()  # new turn started -- still an active conversation
                     await self._send_text(json.dumps({"type": "assistant_speaking", "state": "start"}))
 
                 if sc.output_transcription and sc.output_transcription.text:
@@ -237,7 +249,6 @@ class LiveSession:
                 if (sc.turn_complete or sc.interrupted) and self._speaking:
                     self._speaking = False
                     await self._send_text(json.dumps({"type": "assistant_speaking", "state": "stop"}))
-                    self._start_idle_timer()  # reply finished -- start counting down to auto-close
         except asyncio.CancelledError:
             # An external close() (shutdown, idle timeout) is already tearing
             # this down -- don't re-run cleanup on top of that.
