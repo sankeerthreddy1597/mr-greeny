@@ -48,21 +48,13 @@ into `backend/wakeword_models/` and gets listed in `WAKEWORD_MODEL_PATHS` in
 `backend/app.py`. Until you do that, the backend falls back to openWakeWord's
 bundled pretrained wake words so you can verify the pipeline end-to-end first.
 
-## What's scaffolded vs. still a TODO
+## Status
 
-Done:
-- Firmware: Wi-Fi connect, WebSocket client, mic capture via the board's
-  ES7210 codec, streaming raw PCM to the backend, basic LVGL status text.
-- Backend: WebSocket endpoint, wake-word detection wired to openWakeWord,
-  naive silence-based utterance boundary, WAV packaging.
-
-Not done yet (intentionally left as stubs, see inline `TODO`s):
-- The actual AI/speech call (`run_ai_speech_turn` in `backend/app.py`) —
-  no LLM credentials or provider choice baked in.
-- Playing the reply back through the board's speaker (ES8311) — currently
-  only a JSON `{status, reply}` message goes back over the socket.
-- Any on-screen face/UI beyond a plain status label.
-- Real VAD (currently a simple RMS-based silence heuristic).
+This has grown well past the original scaffold — wake word → Gemini Live
+conversation → spoken reply through the board's speaker all work end to end,
+with an animated eyes/mouth UI. See **[CLAUDE.md](CLAUDE.md)** for the current
+detailed status, known open items, and non-obvious gotchas worth reading
+before changing related code.
 
 ## Build & flash the firmware
 
