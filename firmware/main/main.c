@@ -99,9 +99,11 @@ static lv_obj_t *make_eye(lv_obj_t *parent)
     return eye;
 }
 
-// Fast, continuous open/close pulse simulating a talking mouth. Runs
-// forever in the background once started; toggling s_mouth's HIDDEN flag
-// (see show_talking) is what actually turns it on/off visually.
+// Fast, continuous open/close pulse simulating a talking mouth. Only runs
+// while actually talking (started/stopped in show_talking) -- letting this
+// run forever in the background even while hidden meant it kept invalidating
+// s_mouth every 150ms with nobody watching, which was a plausible contributor
+// to leftover "residue" pixels around exactly the moment visibility toggled.
 static void mouth_pulse_cb(void *var, int32_t v)
 {
     lv_obj_set_height((lv_obj_t *)var, v);
@@ -160,7 +162,8 @@ static void setup_ui(void)
     lv_obj_set_style_radius(s_mouth, MOUTH_HEIGHT_CLOSED / 2, 0);
     lv_obj_align(s_mouth, LV_ALIGN_CENTER, 0, MOUTH_Y_OFFSET);
     lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
-    start_mouth_pulse();
+    // Pulse animation is started/stopped per-talking-turn in show_talking(),
+    // not here -- see the note on start_mouth_pulse().
 
     bsp_display_unlock();
 }
@@ -205,13 +208,20 @@ static void show_eyes(void)
 
 // Mouth toggles on top of the already-visible eyes; a single small object's
 // visibility flag is a small enough invalidate that it doesn't need the
-// two-refresh-cycle staggering show_eyes/show_status_text use.
+// two-refresh-cycle staggering show_eyes/show_status_text use. The pulse
+// animation itself only runs while talking=true (see start_mouth_pulse) --
+// stopping it here and resetting to the closed height means there's no
+// stray mid-pulse frame left behind if a redraw around this transition ever
+// fails to queue.
 static void show_talking(bool talking)
 {
     bsp_display_lock(-1);
     if (talking) {
         lv_obj_clear_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
+        start_mouth_pulse();
     } else {
+        lv_anim_delete(s_mouth, mouth_pulse_cb);
+        lv_obj_set_height(s_mouth, MOUTH_HEIGHT_CLOSED);
         lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
     }
     bsp_display_unlock();

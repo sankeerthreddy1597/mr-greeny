@@ -35,7 +35,10 @@ CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_26=y
 CONFIG_LV_USE_FONT_COMPRESSED=y
 CONFIG_LV_TXT_BREAK_CHARS=" ,.;:-_"
-CONFIG_LV_USE_SYSMON=y
-CONFIG_LV_USE_PERF_MONITOR=y
+# LV_USE_PERF_MONITOR draws a live FPS/CPU overlay (default bottom-right) --
+# fine for benchmarking the original demo this scaffold came from, but shows
+# up as unexplained moving pixels in the real UI. Left disabled here.
+# CONFIG_LV_USE_SYSMON is not set
+# CONFIG_LV_USE_PERF_MONITOR is not set
 CONFIG_LV_USE_IMGFONT=y
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
