@@ -487,6 +487,38 @@ static void start_speaker(void)
     xTaskCreatePinnedToCore(playback_task, "playback", 4096, NULL, 5, NULL, 0);
 }
 
+// TEMPORARY: plays a synthesized 440Hz tone through the exact same queue ->
+// lazy-open -> esp_codec_dev_write() path real Gemini audio uses, but with
+// no network/backend/Gemini involved at all -- isolates whether the speaker
+// hardware/wiring/codec path itself works, independent of everything else.
+// Remove once speaker output is confirmed working end-to-end.
+static void play_test_tone(void)
+{
+    const int duration_ms = 1000;
+    const int n_samples = SPEAKER_SAMPLE_RATE * duration_ms / 1000;
+    int16_t *tone = heap_caps_malloc(n_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (tone == NULL) {
+        ESP_LOGW(TAG, "test tone alloc failed");
+        return;
+    }
+    const float freq = 440.0f;
+    const float two_pi = 6.28318530718f;
+    for (int i = 0; i < n_samples; i++) {
+        tone[i] = (int16_t)(8000.0f * sinf(two_pi * freq * i / SPEAKER_SAMPLE_RATE));
+    }
+
+    playback_chunk_t chunk = {
+        .data = (uint8_t *)tone,
+        .len = n_samples * sizeof(int16_t),
+    };
+    if (xQueueSend(s_playback_queue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "test tone enqueue failed");
+        free(tone);
+    } else {
+        ESP_LOGI(TAG, "test tone queued (440Hz, 1s) -- listen for it now");
+    }
+}
+
 static void start_websocket(void)
 {
     esp_websocket_client_config_t ws_cfg = {
@@ -546,6 +578,7 @@ void app_main(void)
     start_websocket();
     start_mic();
     start_speaker();
+    play_test_tone();  // TEMPORARY: remove once speaker output is confirmed working
 
     xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 0);
 }
