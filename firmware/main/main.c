@@ -484,7 +484,7 @@ static void start_speaker(void)
     s_playback_queue = xQueueCreate(8, sizeof(playback_chunk_t));
     assert(s_playback_queue != NULL);
 
-    xTaskCreate(playback_task, "playback", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(playback_task, "playback", 4096, NULL, 5, NULL, 0);
 }
 
 static void start_websocket(void)
@@ -501,13 +501,41 @@ static void start_websocket(void)
     esp_websocket_client_start(s_ws_client);
 }
 
+// The SPI transaction queue depth (CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH) is
+// already at the BSP Kconfig's enforced max of 10 -- not a lever we can
+// pull. LVGL's own task defaults to no core affinity (can land on either
+// core), same as our mic/network/audio tasks and Wi-Fi/LWIP's internal
+// tasks (which ESP-IDF conventionally keeps on core 0) -- if LVGL's task
+// happens to share a core with a burst of network/audio activity, its own
+// queue-servicing can fall behind, which is a real, plausible contributor
+// to the SPI NO_MEM bursts seen during sustained mic-streaming/Gemini-Live
+// activity. Pinning LVGL to core 1 and our own tasks to core 0 removes that
+// specific contention path (though see the caveat where this is used below
+// -- it reduces one real source of contention, it's not guaranteed to be
+// the only one).
+static lv_display_t *start_display(void)
+{
+    bsp_display_cfg_t cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+        .touch_flags = {
+            .swap_xy = 0,
+            .mirror_x = 1,
+            .mirror_y = 1,
+        },
+    };
+    cfg.lv_adapter_cfg.task_core_id = 1;
+    return bsp_display_start_with_config(&cfg);
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    bsp_display_start();
+    start_display();
     setup_ui();
 
     // Blocks until Wi-Fi station is up. SSID/password are set via
@@ -519,5 +547,5 @@ void app_main(void)
     start_mic();
     start_speaker();
 
-    xTaskCreate(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(mic_stream_task, "mic_stream", 4096, NULL, 5, NULL, 0);
 }
