@@ -105,10 +105,20 @@ class WakeGate:
         self.awake = False
 
     def check(self, pcm_bytes: bytes) -> bool:
-        if self.awake:
-            return False
+        # Always feed the model, even while already awake -- it keeps an
+        # internal sliding-window audio buffer (mel-spectrogram/embedding
+        # history) that must stay continuously fed. Skipping predict() for
+        # the whole ~10s conversation (the old code returned before ever
+        # calling it) let that buffer go stale, so the instant we rearmed
+        # and resumed feeding it, the model saw old buffered features jump
+        # straight to new audio 10+ seconds later -- that discontinuity
+        # itself was very likely producing an immediate spurious "detection"
+        # with no real wake word spoken, matching the suspiciously exact
+        # ~10.3s open/close/reopen period observed in testing.
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
         predictions = wakeword_model.predict(samples)
+        if self.awake:
+            return False
         if any(score > WAKE_SCORE_THRESHOLD for score in predictions.values()):
             self.awake = True
             return True
