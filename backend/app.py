@@ -85,7 +85,7 @@ WAKE_SCORE_THRESHOLD = 0.5
 # reply finishes, before closing it and re-arming the wake word. Mirrors
 # Pixel's short "still listening" follow-up window -- long enough for a
 # natural pause in conversation, short enough not to bill/stream forever.
-IDLE_TIMEOUT_SECONDS = 15.0
+IDLE_TIMEOUT_SECONDS = 10.0
 
 
 class WakeGate:
@@ -202,18 +202,6 @@ class LiveSession:
         # have short max session durations) went completely unnoticed.
         try:
             async for msg in self._session.receive():
-                # Reset the idle countdown on ANY message from Gemini, not
-                # just a clean turn_complete -- the Live API docs note
-                # turn_complete can be held back pending an assumed
-                # "realtime playback finished" signal that we never send
-                # (we're not doing literal client-side playback progress
-                # reporting), so relying on it alone meant the countdown
-                # sometimes never started at all and the session never
-                # idle-closed. This is simpler and can't get stuck the same
-                # way: 15s of Gemini going completely silent, for any
-                # reason, is a reasonable definition of "conversation over."
-                self._start_idle_timer()
-
                 # go_away is a sibling of server_content, not nested inside it.
                 if msg.go_away is not None:
                     log.warning("Gemini Live GoAway received (time_left=%s) -- closing session",
@@ -222,8 +210,26 @@ class LiveSession:
 
                 sc = msg.server_content
                 if sc is None:
-                    log.debug("Live message with no server_content: %s", msg)
+                    # Gemini sends other top-level signal types with no
+                    # server_content at all (voice_activity, usage_metadata,
+                    # etc.) -- these can arrive continuously/periodically
+                    # even during silence, e.g. as VAD housekeeping. An
+                    # earlier version reset the idle countdown on ANY
+                    # message including these, which meant the session
+                    # basically never actually went idle. Only genuine
+                    # server_content below counts as "activity".
+                    log.info("Live message with no server_content (set fields: %s) -- not activity",
+                             msg.model_fields_set)
                     continue
+
+                # Real conversational content -- safe to treat as activity
+                # and reset the idle countdown. This also covers the case
+                # where turn_complete itself is delayed/never fires cleanly
+                # (per the Live API docs, it can be held back pending an
+                # assumed "realtime playback finished" signal we never send):
+                # the countdown still starts from whenever the last genuine
+                # content message arrived, not from a specific flag.
+                self._start_idle_timer()
 
                 if sc.model_turn and not self._speaking:
                     self._speaking = True
